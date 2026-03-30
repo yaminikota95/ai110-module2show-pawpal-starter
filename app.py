@@ -4,16 +4,34 @@ from pawpal_system import Owner, Pet, Task, Priority, Frequency, Scheduler, Dail
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
 st.title("🐾 PawPal+")
 
+DATA_FILE = "data.json"
+
+
+def _save() -> None:
+    """Persist the current owner state to data.json."""
+    st.session_state.owner.save_to_json(DATA_FILE)
+
+
 # ---------------------------------------------------------------------------
-# Session state — initialize once per browser session
+# Session state — load from data.json on first run, fall back to defaults
 # ---------------------------------------------------------------------------
 if "owner" not in st.session_state:
-    st.session_state.owner = Owner(name="Jordan", available_minutes=60)
-
-if "pet" not in st.session_state:
-    default_pet = Pet(name="Mochi", species="dog", age=3)
-    st.session_state.owner.add_pet(default_pet)
-    st.session_state.pet = default_pet
+    try:
+        owner = Owner.load_from_json(DATA_FILE)
+        st.session_state.owner = owner
+        pets = owner.get_pets()
+        if pets:
+            st.session_state.pet = pets[0]
+        else:
+            default_pet = Pet(name="Mochi", species="dog", age=3)
+            owner.add_pet(default_pet)
+            st.session_state.pet = default_pet
+            _save()
+    except (FileNotFoundError, KeyError, ValueError):
+        st.session_state.owner = Owner(name="Jordan", available_minutes=60)
+        default_pet = Pet(name="Mochi", species="dog", age=3)
+        st.session_state.owner.add_pet(default_pet)
+        st.session_state.pet = default_pet
 
 # ---------------------------------------------------------------------------
 # Owner + Pet setup
@@ -29,16 +47,17 @@ with col1:
     )
 with col2:
     pet_name = st.text_input("Pet name", value=st.session_state.pet.name)
-    species  = st.selectbox(
-        "Species", ["dog", "cat", "other"],
-        index=["dog", "cat", "other"].index(st.session_state.pet.species),
-    )
+    species_options = ["dog", "cat", "other"]
+    current_species = st.session_state.pet.species
+    species_index = species_options.index(current_species) if current_species in species_options else 2
+    species = st.selectbox("Species", species_options, index=species_index)
 
 if st.button("Save owner & pet"):
     st.session_state.owner.name              = owner_name
     st.session_state.owner.available_minutes = available_minutes
     st.session_state.pet.name                = pet_name
     st.session_state.pet.species             = species
+    _save()
     st.success(f"Saved: {owner_name} with {pet_name} ({species}), {available_minutes} min budget.")
 
 st.divider()
@@ -69,6 +88,7 @@ if st.button("Add task"):
         st.error("Invalid task — check the title, duration, or time format (HH:MM).")
     else:
         st.session_state.pet.add_task(task)
+        _save()
         st.success(f"Added '{task_title}' to {st.session_state.pet.name}.")
 
 # --- Filter controls ---

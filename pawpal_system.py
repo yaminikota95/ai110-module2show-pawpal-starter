@@ -1,4 +1,6 @@
 from __future__ import annotations
+import json
+import pathlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -99,6 +101,33 @@ class Task:
             return True   # no due_date set → treat as due immediately
         return date.fromisoformat(self.due_date) <= date.fromisoformat(today)
 
+    def to_dict(self) -> dict:
+        """Serialize this Task to a plain dictionary suitable for JSON."""
+        return {
+            "id":               self.id,
+            "title":            self.title,
+            "duration_minutes": self.duration_minutes,
+            "priority":         self.priority.name,      # "HIGH" | "MEDIUM" | "LOW"
+            "fixed_time":       self.fixed_time,
+            "frequency":        self.frequency.value,    # "once" | "daily" | "weekly"
+            "is_completed":     self.is_completed,
+            "due_date":         self.due_date,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Task":
+        """Reconstruct a Task from a dictionary produced by to_dict()."""
+        return cls(
+            id=data["id"],
+            title=data["title"],
+            duration_minutes=data["duration_minutes"],
+            priority=Priority[data["priority"]],
+            fixed_time=data.get("fixed_time"),
+            frequency=Frequency(data.get("frequency", "daily")),
+            is_completed=data.get("is_completed", False),
+            due_date=data.get("due_date"),
+        )
+
     def urgency_score(self, today: str) -> float:
         """Return a float urgency score — lower means schedule sooner.
 
@@ -178,6 +207,28 @@ class Pet:
         """Return the number of incomplete tasks for this pet."""
         return sum(1 for t in self._tasks if not t.is_completed)
 
+    def to_dict(self) -> dict:
+        """Serialize this Pet to a plain dictionary suitable for JSON."""
+        return {
+            "name":    self.name,
+            "species": self.species,
+            "age":     self.age,
+            "tasks":   [t.to_dict() for t in self._tasks],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Pet":
+        """Reconstruct a Pet (with all its tasks) from a to_dict() dictionary.
+
+        Tasks are appended directly to _tasks rather than going through
+        add_task() so that already-completed or duplicate-id tasks stored
+        on disk are restored exactly as they were saved.
+        """
+        pet = cls(name=data["name"], species=data["species"], age=data["age"])
+        for task_data in data.get("tasks", []):
+            pet._tasks.append(Task.from_dict(task_data))
+        return pet
+
 
 # ---------------------------------------------------------------------------
 # Owner
@@ -250,6 +301,50 @@ class Owner:
     def total_pending_minutes(self) -> int:
         """Sum of duration_minutes for all pending tasks across all pets."""
         return sum(t.duration_minutes for _, t in self.get_all_tasks())
+
+    def to_dict(self) -> dict:
+        """Serialize this Owner (and all nested Pets/Tasks) to a dictionary."""
+        return {
+            "name":              self.name,
+            "available_minutes": self.available_minutes,
+            "preferences":       self.preferences,
+            "pets":              [p.to_dict() for p in self._pets],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Owner":
+        """Reconstruct an Owner from a to_dict() dictionary.
+
+        Pets are appended directly to _pets rather than going through
+        add_pet() so that duplicate-name pets stored on disk are restored
+        exactly as saved.
+        """
+        owner = cls(
+            name=data["name"],
+            available_minutes=data.get("available_minutes", 60),
+            preferences=data.get("preferences", []),
+        )
+        for pet_data in data.get("pets", []):
+            owner._pets.append(Pet.from_dict(pet_data))
+        return owner
+
+    def save_to_json(self, path: str) -> None:
+        """Write the full owner state to a JSON file at *path*.
+
+        Creates or overwrites the file. Raises OSError if the path is not
+        writable.
+        """
+        pathlib.Path(path).write_text(json.dumps(self.to_dict(), indent=2))
+
+    @classmethod
+    def load_from_json(cls, path: str) -> "Owner":
+        """Load and return an Owner from a JSON file previously written by
+        save_to_json().
+
+        Raises FileNotFoundError if the file does not exist, or ValueError
+        / KeyError if the contents are malformed.
+        """
+        return cls.from_dict(json.loads(pathlib.Path(path).read_text()))
 
 
 # ---------------------------------------------------------------------------
