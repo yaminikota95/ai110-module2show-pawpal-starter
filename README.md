@@ -40,6 +40,35 @@ After all tasks are placed, `Scheduler._detect_conflicts()` scans every unique p
 
 ---
 
+## Testing PawPal+
+
+### Run the test suite
+
+```bash
+python -m pytest tests/test_pawpal.py -v
+```
+
+### What the tests cover
+
+The suite contains **17 tests** across three areas:
+
+**Sorting correctness**
+Verifies that the final schedule is always in chronological (wall-clock) order, that `_sort_tasks` places HIGH-priority tasks before LOW-priority ones, and that tasks of equal priority are ordered shortest-first so small tasks don't block larger ones.
+
+**Recurrence logic**
+Confirms that completing a DAILY task appends a successor due tomorrow, a WEEKLY task appends one due in 7 days, and a ONCE task produces no successor at all. Also checks that a completed ONCE task disappears from the next generated plan, and that a task with a future `due_date` is correctly excluded from today's schedule.
+
+**Conflict detection**
+Ensures that two fixed tasks with overlapping time windows produce a warning and that the conflicting task lands in `skipped` rather than `scheduled`. Also verifies the inverse: non-overlapping tasks and back-to-back tasks (end time == start time) generate zero warnings.
+
+### Confidence level
+
+**4 / 5 stars**
+
+The core scheduling behaviors — priority sorting, recurring task lifecycle, and fixed-time conflict detection — are well covered and all 17 tests pass. One star is held back because the test suite does not yet exercise the Streamlit UI layer, multi-pet interactions across owners, or edge cases around the owner's time budget running out mid-schedule. Those paths exist in the code but are untested.
+
+---
+
 ## Getting started
 
 ### Setup
