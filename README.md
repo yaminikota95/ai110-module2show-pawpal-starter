@@ -57,6 +57,31 @@ The UI displays four `st.metric` tiles (tasks scheduled, tasks skipped, minutes 
 
 Every placement and skip decision appends a plain-English sentence to `DailyPlan.reasoning`. The log is exposed in a collapsible `st.expander` so it is available when you want to understand a decision but stays out of the way during normal use.
 
+### Urgency-weighted prioritization *(Agent Mode feature)*
+
+Static priority alone has a blind spot: a HIGH task added today outranks a MEDIUM task that has been pending for four days, even when the MEDIUM task is genuinely more urgent. PawPal+ solves this with a dynamic urgency score computed at scheduling time.
+
+**Formula:** `urgency_score = max(priority.value − days_overdue × 0.4, 0.1)`
+
+| Task | Priority value | Days overdue | Urgency score | Scheduled position |
+|---|---|---|---|---|
+| Fresh HIGH | 1.0 | 0 | **1.0** | 1st |
+| MEDIUM, 2 days overdue | 2.0 | 2 | **1.2** | 2nd |
+| MEDIUM, 4 days overdue | 2.0 | 4 | **0.4** | ahead of fresh HIGH |
+| LOW, 6 days overdue | 3.0 | 6 | **0.6** | between HIGH and MEDIUM |
+
+Lower score = placed earlier. The floor of `0.1` ensures no task ever scores negative. Crossover points: a MEDIUM task overtakes a fresh HIGH after **3 days** overdue; a LOW task overtakes a fresh HIGH after **5 days** overdue.
+
+The score is calculated in `Task.urgency_score(today)` and used as the primary sort key in `Scheduler._sort_tasks()`, replacing the static `priority.value` that was there before. Duration remains the tiebreaker for tasks with equal scores.
+
+#### How Agent Mode was used to implement this
+
+This feature was implemented using Claude Code in Agent Mode. Rather than writing the algorithm manually, the following prompt was given to the agent:
+
+> *"Add a third algorithmic capability to pawpal_system.py. Implement urgency-weighted scoring on Task — a method that combines priority with days overdue into a single float. Update Scheduler._sort_tasks to use it as the primary sort key. Add 5 tests covering: fresh task score equals priority value, score decreases as overdue days grow, an overdue MEDIUM outranks a fresh HIGH, the floor never goes negative, and fresh tasks still sort in priority order. Document the formula and crossover points. Run the full test suite and confirm all tests pass."*
+
+Agent Mode worked autonomously across three files — `pawpal_system.py`, `tests/test_pawpal.py`, and this README — in a single pass: it added `urgency_score()` to `Task`, updated `_sort_tasks()` with a `today` parameter defaulting to `date.today()` so existing call sites required no changes, wrote five targeted tests, and verified all 22 tests passed before stopping. The key judgment call the agent made correctly was keeping `today` optional so the existing test suite and the `app.py` call to `_sort_tasks` both continued to work without modification.
+
 ---
 
 ## Project structure

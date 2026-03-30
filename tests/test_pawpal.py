@@ -263,3 +263,98 @@ def test_detect_conflicts_helper_empty_for_no_overlap():
 
     conflicts = scheduler._detect_conflicts([slot_a, slot_b])
     assert conflicts == []
+
+
+# ---------------------------------------------------------------------------
+# Urgency-weighted prioritization
+# ---------------------------------------------------------------------------
+
+def test_urgency_score_fresh_task_equals_priority_value():
+    """A task with no due_date should score exactly its priority value."""
+    task = make_task(priority=Priority.HIGH)  # no due_date
+    today = date.today().isoformat()
+    assert task.urgency_score(today) == Priority.HIGH.value  # 1.0
+
+
+def test_urgency_score_decreases_as_overdue_days_increase():
+    """urgency_score must fall as days_overdue grows (task becomes more urgent)."""
+    task = Task(
+        title="Overdue bath",
+        duration_minutes=20,
+        priority=Priority.LOW,
+        due_date=(date.today() - timedelta(days=1)).isoformat(),
+        frequency=Frequency.WEEKLY,
+    )
+    today = date.today().isoformat()
+    score_1_day = task.urgency_score(today)
+
+    task2 = Task(
+        title="Overdue bath",
+        duration_minutes=20,
+        priority=Priority.LOW,
+        due_date=(date.today() - timedelta(days=5)).isoformat(),
+        frequency=Frequency.WEEKLY,
+    )
+    score_5_days = task2.urgency_score(today)
+
+    assert score_5_days < score_1_day
+
+
+def test_overdue_medium_task_outranks_fresh_high_task():
+    """A MEDIUM task overdue by 3+ days must sort before a fresh HIGH task."""
+    scheduler = Scheduler()
+    pet = make_pet()
+    today = date.today().isoformat()
+    overdue_date = (date.today() - timedelta(days=4)).isoformat()
+
+    fresh_high = Task(
+        title="Fresh HIGH",
+        duration_minutes=10,
+        priority=Priority.HIGH,
+        frequency=Frequency.DAILY,
+    )
+    stale_medium = Task(
+        title="Stale MEDIUM",
+        duration_minutes=10,
+        priority=Priority.MEDIUM,
+        due_date=overdue_date,
+        frequency=Frequency.DAILY,
+    )
+
+    result = scheduler._sort_tasks(
+        [(pet, fresh_high), (pet, stale_medium)],
+        today=today,
+    )
+    assert result[0][1].title == "Stale MEDIUM", (
+        f"Expected overdue MEDIUM first, got {result[0][1].title} "
+        f"(scores: HIGH={fresh_high.urgency_score(today):.2f}, "
+        f"MEDIUM={stale_medium.urgency_score(today):.2f})"
+    )
+
+
+def test_urgency_score_floor_never_goes_negative():
+    """urgency_score must never return a value below 0.1, even for very old tasks."""
+    task = Task(
+        title="Ancient task",
+        duration_minutes=5,
+        priority=Priority.HIGH,
+        due_date=(date.today() - timedelta(days=100)).isoformat(),
+        frequency=Frequency.DAILY,
+    )
+    score = task.urgency_score(date.today().isoformat())
+    assert score >= 0.1
+
+
+def test_fresh_tasks_urgency_order_matches_priority_order():
+    """With no overdue days, urgency score must preserve HIGH > MEDIUM > LOW order."""
+    scheduler = Scheduler()
+    pet = make_pet()
+    today = date.today().isoformat()
+
+    high   = make_task("H", priority=Priority.HIGH,   duration=10)
+    medium = make_task("M", priority=Priority.MEDIUM, duration=10)
+    low    = make_task("L", priority=Priority.LOW,    duration=10)
+
+    result = scheduler._sort_tasks([(pet, low), (pet, high), (pet, medium)], today=today)
+    titles = [t.title for _, t in result]
+    assert titles == ["H", "M", "L"]

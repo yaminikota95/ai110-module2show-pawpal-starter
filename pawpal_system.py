@@ -99,6 +99,31 @@ class Task:
             return True   # no due_date set → treat as due immediately
         return date.fromisoformat(self.due_date) <= date.fromisoformat(today)
 
+    def urgency_score(self, today: str) -> float:
+        """Return a float urgency score — lower means schedule sooner.
+
+        Combines priority with how many days the task is overdue so that
+        neglected tasks naturally rise above fresh lower-priority ones.
+
+        Formula: max(priority.value - days_overdue * 0.4, 0.1)
+          - A fresh HIGH task scores 1.0.
+          - A MEDIUM task overdue by 3 days scores 2.0 - 1.2 = 0.8,
+            placing it ahead of the fresh HIGH.
+          - The floor of 0.1 prevents negative scores regardless of age.
+
+        Crossover points (when an overdue task overtakes a fresh one):
+          MEDIUM overtakes fresh HIGH after 3 days overdue.
+          LOW    overtakes fresh HIGH after 5 days overdue.
+        """
+        if self.due_date is None:
+            days_overdue = 0
+        else:
+            days_overdue = max(
+                0,
+                (date.fromisoformat(today) - date.fromisoformat(self.due_date)).days,
+            )
+        return max(self.priority.value - days_overdue * 0.4, 0.1)
+
 
 # ---------------------------------------------------------------------------
 # Pet
@@ -358,7 +383,7 @@ class Scheduler:
         )
         free_gaps = self._free_gaps(occupied, owner.available_minutes)
 
-        for pet, task in self._sort_tasks(flexible):
+        for pet, task in self._sort_tasks(flexible, today):
             placed = False
             needed = task.duration_minutes + self.BUFFER_MINUTES
             for i, (gap_start, gap_end) in enumerate(free_gaps):
@@ -443,23 +468,36 @@ class Scheduler:
                 )
         return found
 
-    def _sort_tasks(self, tasks: list[tuple[Pet, Task]]) -> list[tuple[Pet, Task]]:
+    def _sort_tasks(
+        self,
+        tasks: list[tuple[Pet, Task]],
+        today: Optional[str] = None,
+    ) -> list[tuple[Pet, Task]]:
         """Sort flexible tasks so the scheduler fills gaps most effectively.
 
         Sorting key is a two-element tuple so Python's stable sort applies
         criteria in order:
-          1. Priority value (HIGH=1 < MEDIUM=2 < LOW=3) — critical tasks go first.
-          2. Duration (shortest first) — among equal-priority tasks, shorter ones
-             are tried first, which tends to leave larger gaps available for later
-             tasks rather than consuming them greedily.
+          1. Urgency score (Task.urgency_score) — combines priority with how
+             many days the task is overdue.  A MEDIUM task overdue by 3+ days
+             scores lower (more urgent) than a fresh HIGH task, so neglected
+             tasks naturally rise in the schedule without manual intervention.
+          2. Duration (shortest first) — among equal-urgency tasks, shorter
+             ones are tried first to leave larger gaps for later tasks.
 
         Args:
             tasks: List of (Pet, Task) pairs with no fixed_time set.
+            today: ISO date string used to calculate days overdue.
+                   Defaults to date.today() when None.
 
         Returns:
             A new sorted list; the original is not mutated.
         """
-        return sorted(tasks, key=lambda x: (x[1].priority.value, x[1].duration_minutes))
+        if today is None:
+            today = date.today().isoformat()
+        return sorted(
+            tasks,
+            key=lambda x: (x[1].urgency_score(today), x[1].duration_minutes),
+        )
 
     def _overlaps(self, a: Task, b: Task) -> bool:
         """Return True if two fixed-time tasks overlap."""
