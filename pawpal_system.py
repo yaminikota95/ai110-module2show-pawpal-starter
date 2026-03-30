@@ -1,7 +1,9 @@
 from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from enum import Enum
+from itertools import combinations
 from typing import Optional
 
 
@@ -34,6 +36,7 @@ class Task:
     fixed_time: Optional[str] = None        # "HH:MM" or None for flexible
     frequency: Frequency = Frequency.DAILY
     is_completed: bool = False
+    due_date: Optional[str] = None   # "YYYY-MM-DD" — when this occurrence is next due
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     # Identity is based solely on id
@@ -65,6 +68,36 @@ class Task:
     def mark_incomplete(self) -> None:
         """Reset this task to incomplete (e.g. for recurring tasks)."""
         self.is_completed = False
+
+    def next_occurrence(self) -> Optional["Task"]:
+        """Return a fresh Task for the next run, or None if this task is ONCE.
+
+        due_date is calculated with timedelta so is_due_today() only needs
+        a single date comparison — no delta arithmetic at read time.
+          DAILY  → due_date = today + 1 day
+          WEEKLY → due_date = today + 7 days
+        """
+        if self.frequency == Frequency.ONCE:
+            return None
+        intervals = {Frequency.DAILY: 1, Frequency.WEEKLY: 7}
+        next_due = date.today() + timedelta(days=intervals[self.frequency])
+        return Task(
+            title=self.title,
+            duration_minutes=self.duration_minutes,
+            priority=self.priority,
+            fixed_time=self.fixed_time,
+            frequency=self.frequency,
+            is_completed=False,
+            due_date=next_due.isoformat(),
+        )
+
+    def is_due_today(self, today: str) -> bool:
+        """Return True if this task should appear in today's schedule."""
+        if self.frequency == Frequency.ONCE:
+            return not self.is_completed
+        if self.due_date is None:
+            return True   # no due_date set → treat as due immediately
+        return date.fromisoformat(self.due_date) <= date.fromisoformat(today)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +133,21 @@ class Pet:
         if include_completed:
             return list(self._tasks)
         return [t for t in self._tasks if not t.is_completed]
+
+    def complete_task(self, task_id: str) -> Optional[Task]:
+        """Mark a task complete and, if it recurs, append the next occurrence.
+
+        Returns the newly created successor Task, or None for ONCE tasks.
+        No-op (returns None) if task_id is not found.
+        """
+        task = self.get_task(task_id)
+        if task is None:
+            return None
+        task.mark_complete()
+        successor = task.next_occurrence()
+        if successor is not None:
+            self._tasks.append(successor)
+        return successor
 
     def pending_count(self) -> int:
         """Return the number of incomplete tasks for this pet."""
@@ -140,6 +188,40 @@ class Owner:
             for task in pet.get_tasks(include_completed=include_completed)
         ]
 
+    def filter_tasks(
+        self,
+        pet_name: Optional[str] = None,
+        completed: Optional[bool] = None,
+    ) -> list[tuple[Pet, Task]]:
+        """Return (pet, task) pairs filtered by pet name and/or completion status.
+
+        Both parameters are optional and act as independent narrowing filters —
+        omitting one means "don't filter on that axis." They are applied in
+        sequence: pet_name first, then completion status.
+
+        Args:
+            pet_name:  Only include tasks belonging to this pet. None = all pets.
+            completed: True = completed tasks only, False = pending only, None = both.
+
+        Returns:
+            A list of (Pet, Task) tuples matching all supplied criteria.
+
+        Examples:
+            owner.filter_tasks()                        # all tasks, all pets
+            owner.filter_tasks(pet_name="Mochi")        # Mochi's tasks only
+            owner.filter_tasks(completed=False)         # pending across all pets
+            owner.filter_tasks(pet_name="Luna", completed=True)  # Luna's done tasks
+        """
+        pairs = self.get_all_tasks(include_completed=True)
+
+        if pet_name is not None:
+            pairs = [(p, t) for p, t in pairs if p.name == pet_name]
+
+        if completed is not None:
+            pairs = [(p, t) for p, t in pairs if t.is_completed == completed]
+
+        return pairs
+
     def total_pending_minutes(self) -> int:
         """Sum of duration_minutes for all pending tasks across all pets."""
         return sum(t.duration_minutes for _, t in self.get_all_tasks())
@@ -171,6 +253,7 @@ class DailyPlan:
     skipped: list[ScheduledTask]    # same type; start_time/end_time are empty strings
     total_minutes_used: int
     reasoning: list[str]
+    warnings: list[str]             # conflict warnings — surfaced separately from verbose reasoning
 
     def summary(self) -> str:
         """Return a human-readable string of the full daily plan."""
@@ -178,6 +261,12 @@ class DailyPlan:
             f"Plan for {self.owner.name}",
             f"Time budget: {self.owner.available_minutes} min  |  Used: {self.total_minutes_used} min\n",
         ]
+        if self.warnings:
+            lines.append("*** CONFLICT WARNINGS ***")
+            for w in self.warnings:
+                lines.append(f"  [!] {w}")
+            lines.append("")
+
         if self.scheduled:
             lines.append("Scheduled:")
             for st in self.scheduled:
@@ -189,7 +278,7 @@ class DailyPlan:
             lines.append("No tasks scheduled.")
 
         if self.skipped:
-            lines.append("\nSkipped (did not fit):")
+            lines.append("\nSkipped (did not fit or conflicted):")
             for st in self.skipped:
                 lines.append(
                     f"  [{st.pet_name}] {st.task.title}  ({st.task.duration_minutes} min)"
@@ -206,19 +295,29 @@ class Scheduler:
     Organises and schedules tasks for an owner's pets.
 
     Algorithm:
-      1. Collect all valid, incomplete tasks from every pet.
-      2. Place fixed-time tasks first (sorted by time); skip later ones that conflict.
+      1. Filter tasks to only those due today (respects Frequency).
+      2. Place fixed-time tasks first (sorted by time); skip conflicting ones.
       3. Fill remaining free gaps with flexible tasks, sorted by priority then duration.
+      4. Run _detect_conflicts() as a final verification pass on the placed schedule.
+      5. Return scheduled list sorted by start time.
     """
+
+    DAY_START = 7 * 60       # schedule begins at 07:00 (minutes since midnight)
+    BUFFER_MINUTES = 5       # minimum gap between consecutive tasks
 
     def generate_plan(self, owner: Owner) -> DailyPlan:
         """Build and return a DailyPlan for the given owner."""
-        all_tasks = owner.get_all_tasks()
+        today = date.today().isoformat()
+        all_tasks = [
+            (p, t) for p, t in owner.get_all_tasks()
+            if t.is_due_today(today)
+        ]
 
         fixed    = [(p, t) for p, t in all_tasks if t.fixed_time is not None]
         flexible = [(p, t) for p, t in all_tasks if t.fixed_time is None]
 
         reasoning: list[str] = []
+        warnings:  list[str] = []
         scheduled: list[ScheduledTask] = []
         skipped:   list[ScheduledTask] = []
         minutes_used = 0
@@ -230,11 +329,15 @@ class Scheduler:
                 (a for _, a in accepted_fixed if self._overlaps(a, task)), None
             )
             if conflict:
-                skipped.append(ScheduledTask(task=task, pet=pet, start_time="", end_time=""))
-                reasoning.append(
-                    f"'{task.title}' ({pet.name}) skipped — conflicts with "
-                    f"'{conflict.title}' at {conflict.fixed_time}."
+                msg = (
+                    f"'{task.title}' ({pet.name}) conflicts with "
+                    f"'{conflict.title}' ({conflict.fixed_time}–"
+                    f"{self._to_str(self._to_min(conflict.fixed_time) + conflict.duration_minutes)}) "
+                    f"— '{task.title}' skipped."
                 )
+                warnings.append(msg)
+                reasoning.append(msg)
+                skipped.append(ScheduledTask(task=task, pet=pet, start_time="", end_time=""))
             else:
                 end = self._to_min(task.fixed_time) + task.duration_minutes
                 scheduled.append(ScheduledTask(
@@ -254,12 +357,12 @@ class Scheduler:
             for _, t in accepted_fixed
         )
         free_gaps = self._free_gaps(occupied, owner.available_minutes)
-        budget = owner.available_minutes - minutes_used
 
         for pet, task in self._sort_tasks(flexible):
             placed = False
+            needed = task.duration_minutes + self.BUFFER_MINUTES
             for i, (gap_start, gap_end) in enumerate(free_gaps):
-                if task.duration_minutes <= gap_end - gap_start:
+                if needed <= gap_end - gap_start:
                     start_str = self._to_str(gap_start)
                     end_str   = self._to_str(gap_start + task.duration_minutes)
                     scheduled.append(ScheduledTask(
@@ -271,9 +374,8 @@ class Scheduler:
                         f"'{task.title}' ({pet.name}) scheduled at {start_str} "
                         f"[{task.priority.name}, {task.duration_minutes} min]."
                     )
-                    free_gaps[i] = (gap_start + task.duration_minutes, gap_end)
+                    free_gaps[i] = (gap_start + needed, gap_end)
                     minutes_used += task.duration_minutes
-                    budget -= task.duration_minutes
                     placed = True
                     break
 
@@ -281,8 +383,14 @@ class Scheduler:
                 skipped.append(ScheduledTask(task=task, pet=pet, start_time="", end_time=""))
                 reasoning.append(
                     f"'{task.title}' ({pet.name}) skipped — needs {task.duration_minutes} min "
-                    f"but only {budget} min remaining."
+                    f"but largest free gap is {max((g[1]-g[0] for g in free_gaps), default=0)} min."
                 )
+
+        # Sort final schedule chronologically
+        scheduled.sort(key=lambda s: self._to_min(s.start_time))
+
+        # Final verification pass — catches any overlaps the scheduler may have missed
+        warnings.extend(self._detect_conflicts(scheduled))
 
         return DailyPlan(
             owner=owner,
@@ -290,14 +398,67 @@ class Scheduler:
             skipped=skipped,
             total_minutes_used=minutes_used,
             reasoning=reasoning,
+            warnings=warnings,
         )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
+    def _detect_conflicts(self, scheduled: list[ScheduledTask]) -> list[str]:
+        """Scan the placed schedule and return a warning string for every overlapping pair.
+
+        This is a verification pass that runs after all tasks have been placed.
+        It acts as a safety net — the scheduler's gap logic should prevent overlaps,
+        but this catches anything that slips through (e.g., back-to-back fixed tasks
+        whose durations were miscalculated, or tasks injected after scheduling).
+
+        Algorithm:
+            Uses itertools.combinations to iterate every unique (a, b) pair without
+            manual index bookkeeping. Because `scheduled` is sorted by start time,
+            once task b starts at or after task a ends (s_b >= e_a), every subsequent
+            b also starts later — the loop breaks early instead of checking them all.
+            Overlap condition: s_a < e_b  (with s_b < e_a already guaranteed by the
+            break above, only one side of the standard two-sided test is needed).
+
+        Args:
+            scheduled: Tasks already placed in time slots, sorted by start time.
+
+        Returns:
+            A list of human-readable warning strings, one per detected conflict.
+            Returns an empty list when no conflicts exist — never raises.
+        """
+        found: list[str] = []
+        for a, b in combinations(scheduled, 2):
+            s_a, e_a = self._to_min(a.start_time), self._to_min(a.end_time)
+            s_b, e_b = self._to_min(b.start_time), self._to_min(b.end_time)
+            if s_b >= e_a:   # b starts after a ends; all later b also start later — stop
+                break
+            if s_a < e_b:    # s_b < e_a already guaranteed above; full overlap confirmed
+                found.append(
+                    f"CONFLICT: [{a.pet_name}] '{a.task.title}' "
+                    f"({a.start_time}–{a.end_time}) overlaps "
+                    f"[{b.pet_name}] '{b.task.title}' "
+                    f"({b.start_time}–{b.end_time})"
+                )
+        return found
+
     def _sort_tasks(self, tasks: list[tuple[Pet, Task]]) -> list[tuple[Pet, Task]]:
-        """Sort by priority (HIGH first), then shortest duration first."""
+        """Sort flexible tasks so the scheduler fills gaps most effectively.
+
+        Sorting key is a two-element tuple so Python's stable sort applies
+        criteria in order:
+          1. Priority value (HIGH=1 < MEDIUM=2 < LOW=3) — critical tasks go first.
+          2. Duration (shortest first) — among equal-priority tasks, shorter ones
+             are tried first, which tends to leave larger gaps available for later
+             tasks rather than consuming them greedily.
+
+        Args:
+            tasks: List of (Pet, Task) pairs with no fixed_time set.
+
+        Returns:
+            A new sorted list; the original is not mutated.
+        """
         return sorted(tasks, key=lambda x: (x[1].priority.value, x[1].duration_minutes))
 
     def _overlaps(self, a: Task, b: Task) -> bool:
@@ -307,15 +468,31 @@ class Scheduler:
         return s1 < e2 and s2 < e1
 
     def _free_gaps(self, occupied: list[tuple[int, int]], budget: int) -> list[tuple[int, int]]:
-        """Return free time intervals within [0, budget] not covered by occupied."""
+        """Compute free time slots available for flexible tasks.
+
+        Walks the list of already-occupied intervals (from fixed-time tasks) in
+        order and collects the gaps between them. The available window is anchored
+        at DAY_START (07:00 by default) rather than midnight, so flexible tasks
+        are never scheduled at unrealistic hours.
+
+        Args:
+            occupied: Sorted list of (start_min, end_min) intervals already claimed
+                      by fixed-time tasks, in minutes since midnight.
+            budget:   Owner's total available minutes for the day.
+
+        Returns:
+            List of (start_min, end_min) free intervals within
+            [DAY_START, DAY_START + budget], excluding all occupied spans.
+        """
+        day_end = self.DAY_START + budget
         gaps: list[tuple[int, int]] = []
-        cursor = 0
+        cursor = self.DAY_START
         for start, end in occupied:
             if cursor < start:
-                gaps.append((cursor, start))
+                gaps.append((cursor, min(start, day_end)))
             cursor = max(cursor, end)
-        if cursor < budget:
-            gaps.append((cursor, budget))
+        if cursor < day_end:
+            gaps.append((cursor, day_end))
         return gaps
 
     @staticmethod

@@ -7,6 +7,10 @@
 - Briefly describe your initial UML design.
 - What classes did you include, and what responsibilities did you assign to each?
 
+I designed six classes. `Owner` holds the user's name and how many minutes they have available in a day, and it owns a list of pets. `Pet` stores a pet's name, species, and age, and is responsible for managing its own list of tasks. `Task` is the core data unit — it holds a title, duration in minutes, priority level, an optional fixed start time for things like medication, and a completion flag. `Priority` is a simple enum (HIGH, MEDIUM, LOW) kept separate so sorting stays clean. `Scheduler` is the brain of the system: it takes an `Owner`, collects all tasks across all pets, sorts them by priority, and greedily fits them into the available time budget while detecting conflicts between fixed-time tasks. Finally, `DailyPlan` is the output object — it holds the list of scheduled tasks, the tasks that didn't fit, total minutes used, and a human-readable reasoning list that explains each scheduling decision.
+
+The key responsibility split was: `Owner`, `Pet`, and `Task` are pure data with no scheduling logic, `Scheduler` owns all the scheduling logic, and `DailyPlan` owns all the output and display logic. This keeps the scheduler fully testable without touching the UI.
+
 **b. Design changes**
 
 - Did your design change during implementation?
