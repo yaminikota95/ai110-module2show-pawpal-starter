@@ -87,25 +87,34 @@ filtered = owner.filter_tasks(
     completed=status_map[filter_status],
 )
 
-# Sort: fixed-time tasks first (chronologically), then flexible by priority
-filtered.sort(key=lambda x: (
-    x[1].fixed_time or "99:99",
-    x[1].priority.value,
-))
+# Use Scheduler._sort_tasks for flexible tasks; fixed-time tasks sorted chronologically
+_scheduler = Scheduler()
+fixed_pairs    = [(p, t) for p, t in filtered if t.fixed_time is not None]
+flexible_pairs = [(p, t) for p, t in filtered if t.fixed_time is None]
 
-if filtered:
-    st.table([
-        {
-            "Pet": p.name,
-            "Title": t.title,
-            "Duration (min)": t.duration_minutes,
-            "Priority": t.priority.name,
-            "Fixed time": t.fixed_time or "flexible",
-            "Frequency": t.frequency.value,
-            "Status": "Done" if t.is_completed else "Pending",
-        }
-        for p, t in filtered
-    ])
+fixed_pairs.sort(key=lambda x: x[1].fixed_time)
+flexible_pairs = _scheduler._sort_tasks(flexible_pairs)
+
+sorted_filtered = fixed_pairs + flexible_pairs
+
+if sorted_filtered:
+    priority_icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
+    st.dataframe(
+        [
+            {
+                "Pet": p.name,
+                "Task": t.title,
+                "Priority": f"{priority_icon.get(t.priority.name, '')} {t.priority.name}",
+                "Duration (min)": t.duration_minutes,
+                "Time": t.fixed_time or "flexible",
+                "Frequency": t.frequency.value,
+                "Status": "✅ Done" if t.is_completed else "⏳ Pending",
+            }
+            for p, t in sorted_filtered
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 else:
     st.info("No tasks match the current filters.")
 
@@ -123,30 +132,79 @@ if st.button("Generate schedule"):
     else:
         plan: DailyPlan = Scheduler().generate_plan(owner)
 
-        st.success(
-            f"Scheduled {len(plan.scheduled)} task(s) — "
-            f"{plan.total_minutes_used} of {owner.available_minutes} min used."
-        )
+        # --- Conflict warnings — shown first so they're impossible to miss ---
+        if plan.warnings:
+            for w in plan.warnings:
+                st.warning(f"⚠️ Conflict detected: {w}")
 
+        # --- Summary metrics ---
+        budget = owner.available_minutes
+        used   = plan.total_minutes_used
+        remaining = budget - used
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Scheduled", len(plan.scheduled))
+        m2.metric("Skipped",   len(plan.skipped))
+        m3.metric("Min used",  used)
+        m4.metric("Min left",  remaining)
+
+        st.progress(min(used / budget, 1.0), text=f"{used} / {budget} min used")
+
+        if plan.warnings:
+            st.error(
+                f"{len(plan.warnings)} conflict(s) found — see warnings above. "
+                "Conflicting tasks were moved to the skipped list."
+            )
+        else:
+            st.success(
+                f"Schedule built cleanly — {len(plan.scheduled)} task(s) placed, "
+                "no conflicts detected."
+            )
+
+        # --- Scheduled tasks table ---
         if plan.scheduled:
-            st.markdown("**Scheduled:**")
-            st.table([
-                {
-                    "Time": f"{s.start_time} – {s.end_time}",
-                    "Pet": s.pet_name,
-                    "Task": s.task.title,
-                    "Priority": s.task.priority.name,
-                }
-                for s in plan.scheduled
-            ])
+            st.markdown("**Scheduled tasks** (chronological order)")
+            priority_icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
+            st.dataframe(
+                [
+                    {
+                        "Start": s.start_time,
+                        "End":   s.end_time,
+                        "Pet":   s.pet_name,
+                        "Task":  s.task.title,
+                        "Priority": (
+                            f"{priority_icon.get(s.task.priority.name, '')} "
+                            f"{s.task.priority.name}"
+                        ),
+                        "Duration (min)": s.task.duration_minutes,
+                    }
+                    for s in plan.scheduled   # already sorted by Scheduler
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
+        # --- Skipped tasks table ---
         if plan.skipped:
-            st.warning(f"{len(plan.skipped)} task(s) didn't fit:")
-            st.table([
-                {"Pet": s.pet_name, "Task": s.task.title, "Duration (min)": s.task.duration_minutes}
-                for s in plan.skipped
-            ])
+            st.markdown("**Skipped tasks** (did not fit or conflicted)")
+            st.dataframe(
+                [
+                    {
+                        "Pet":  s.pet_name,
+                        "Task": s.task.title,
+                        "Duration (min)": s.task.duration_minutes,
+                        "Reason": (
+                            "conflict" if any(s.task.title in w for w in plan.warnings)
+                            else "no time remaining"
+                        ),
+                    }
+                    for s in plan.skipped
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        with st.expander("Reasoning"):
+        # --- Reasoning log ---
+        with st.expander("Scheduler reasoning log"):
             for line in plan.reasoning:
                 st.write(f"- {line}")
